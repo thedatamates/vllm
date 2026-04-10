@@ -332,7 +332,6 @@ class FlashInferBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
-        "nvfp4",
     ]
 
     @staticmethod
@@ -618,17 +617,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.cache_dtype = self.cache_config.cache_dtype
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
-        self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
-        if self.is_kvcache_nvfp4:
-            # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
-            # which is passed to FlashInferImpl
-            self.kv_cache_dtype = self.cache_dtype
-        elif is_quantized_kv_cache(self.cache_dtype):
-            self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
-                self.cache_dtype
-            )
+            self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
+            if self.is_kvcache_nvfp4:
+                # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
+                # which is passed to FlashInferImpl
+                self.kv_cache_dtype = self.cache_dtype
+            else:
+                self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+                    self.cache_dtype
+                )
         else:
             self.cache_dtype = "auto"
+            self.is_kvcache_nvfp4 = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
