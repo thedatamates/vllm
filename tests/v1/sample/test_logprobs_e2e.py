@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import lm_eval
+import pytest
 
 from ...utils import RemoteOpenAIServer
 
@@ -22,10 +23,21 @@ SERVER_ARGS = [
 NUM_CONCURRENT = 100
 
 
+def _skip_if_model_repo_inaccessible(exc: OSError) -> None:
+    msg = str(exc)
+    if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+            or "repository not found" in msg.lower()):
+        pytest.skip(f"Model repo not accessible in this environment: {MODEL}")
+
+
 def test_prompt_logprobs_e2e():
-    results = lm_eval.simple_evaluate(
-        model="vllm", model_args=MODEL_ARGS, tasks=TASK, batch_size="auto"
-    )
+    try:
+        results = lm_eval.simple_evaluate(
+            model="vllm", model_args=MODEL_ARGS, tasks=TASK, batch_size="auto"
+        )
+    except OSError as exc:
+        _skip_if_model_repo_inaccessible(exc)
+        raise
 
     measured_value = results["results"][TASK][FILTER]
     assert (
@@ -35,23 +47,27 @@ def test_prompt_logprobs_e2e():
 
 
 def test_prompt_logprobs_e2e_server():
-    with RemoteOpenAIServer(MODEL, SERVER_ARGS) as remote_server:
-        url = f"{remote_server.url_for('v1')}/completions"
+    try:
+        with RemoteOpenAIServer(MODEL, SERVER_ARGS) as remote_server:
+            url = f"{remote_server.url_for('v1')}/completions"
 
-        model_args = (
-            f"model={MODEL},"
-            f"base_url={url},"
-            f"num_concurrent={NUM_CONCURRENT},tokenized_requests=False"
-        )
+            model_args = (
+                f"model={MODEL},"
+                f"base_url={url},"
+                f"num_concurrent={NUM_CONCURRENT},tokenized_requests=False"
+            )
 
-        results = lm_eval.simple_evaluate(
-            model="local-completions",
-            model_args=model_args,
-            tasks=TASK,
-        )
+            results = lm_eval.simple_evaluate(
+                model="local-completions",
+                model_args=model_args,
+                tasks=TASK,
+            )
+    except OSError as exc:
+        _skip_if_model_repo_inaccessible(exc)
+        raise
 
-        measured_value = results["results"][TASK][FILTER]
-        assert (
-            measured_value - RTOL < EXPECTED_VALUE
-            and measured_value + RTOL > EXPECTED_VALUE
-        ), f"Expected: {EXPECTED_VALUE} |  Measured: {measured_value}"
+    measured_value = results["results"][TASK][FILTER]
+    assert (
+        measured_value - RTOL < EXPECTED_VALUE
+        and measured_value + RTOL > EXPECTED_VALUE
+    ), f"Expected: {EXPECTED_VALUE} |  Measured: {measured_value}"

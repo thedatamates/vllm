@@ -154,7 +154,16 @@ def test_fewer_blocks_with_hma(monkeypatch, model_name, sw_size):
             assert len(group_block_ids) == expected_num_remote_blocks
 
     def run_test_and_cleanup():
-        llm = LLM(**llm_kwargs)
+        try:
+            llm = LLM(**llm_kwargs)
+        except OSError as exc:
+            msg = str(exc)
+            if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+                    or "repository not found" in msg.lower()):
+                pytest.skip(
+                    f"Model repo not accessible in this environment: {model_name}"
+                )
+            raise
         try:
             run_hma_test(llm)
         finally:

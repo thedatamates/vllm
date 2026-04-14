@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TypeAlias
 
 import numpy as np
+import pytest
 import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -31,6 +32,13 @@ STOP_STRINGS = ["I love working on", "company by far", "brother in"]
 PROMPT_LEN = 5
 
 random.seed(42)
+
+
+def skip_if_model_repo_inaccessible(model: str, exc: OSError) -> None:
+    msg = str(exc)
+    if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+            or "repository not found" in msg.lower()):
+        pytest.skip(f"Model repo not accessible in this environment: {model}")
 
 
 def _create_random_top_logprob_test_vector(

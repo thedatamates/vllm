@@ -62,6 +62,18 @@ def _load_groundtruth(filename: str) -> dict:
         return json.load(f)
 
 
+def _build_model_config_or_skip(model: str, *, trust_remote_code: bool) -> ModelConfig:
+    """Skip when the model repo is not locally accessible in this environment."""
+    try:
+        return ModelConfig(model, trust_remote_code=trust_remote_code)
+    except OSError as exc:
+        msg = str(exc)
+        if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+                or "repository not found" in msg.lower()):
+            pytest.skip(f"Model repo not accessible in this environment: {model}")
+        raise
+
+
 def _assert_model_arch_config(
     model_config, expected: dict, check_head_size: bool = True
 ):
@@ -119,8 +131,9 @@ def test_base_model_arch_config(model: str):
     groundtruth = _load_groundtruth("base_model_arch_groundtruth.json")
     expected = groundtruth[model]
 
-    model_config = ModelConfig(
-        model, trust_remote_code=model in BASE_TRUST_REMOTE_CODE_MODELS
+    model_config = _build_model_config_or_skip(
+        model,
+        trust_remote_code=model in BASE_TRUST_REMOTE_CODE_MODELS,
     )
 
     _assert_model_arch_config(model_config, expected)
@@ -137,7 +150,10 @@ def test_draft_model_arch_config(
     groundtruth = _load_groundtruth("draft_model_arch_groundtruth.json")
     expected = groundtruth[draft_model]
 
-    target_model_config = ModelConfig(target_model, trust_remote_code=trust_remote_code)
+    target_model_config = _build_model_config_or_skip(
+        target_model,
+        trust_remote_code=trust_remote_code,
+    )
     speculative_config = SpeculativeConfig(
         model=draft_model,
         num_speculative_tokens=1,

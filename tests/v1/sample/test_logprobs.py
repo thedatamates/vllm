@@ -48,35 +48,60 @@ ROCM_DETERMINISM_KWARGS: dict = (
 )
 
 
+def _skip_if_model_repo_inaccessible(model: str, exc: OSError) -> None:
+    msg = str(exc)
+    if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+            or "repository not found" in msg.lower()):
+        pytest.skip(f"Model repo not accessible in this environment: {model}")
+
+
+def _build_llm_or_skip(model: str, **kwargs):
+    from vllm import LLM
+
+    try:
+        return LLM(model=model, **kwargs)
+    except OSError as exc:
+        _skip_if_model_repo_inaccessible(model, exc)
+        raise
+
+
 @pytest.fixture(
     scope="module",
     # Parameterize APC
     params=[False, True],
 )
 def vllm_model(vllm_runner, request) -> Generator[VllmRunner, None, None]:
-    with vllm_runner(
-        MODEL,
-        dtype=DTYPE,
-        max_logprobs=7,
-        # Very small number of batched tokens to ensure
-        # that we test chunking.
-        max_num_batched_tokens=16,
-        max_num_seqs=16,
-        max_model_len=128,
-        enable_chunked_prefill=True,
-        enforce_eager=True,
-        # TODO: enable this once we support it for
-        # prompt logprobs.
-        enable_prefix_caching=request.param,
-        gpu_memory_utilization=0.4,
-    ) as vllm_model:
-        yield vllm_model
+    try:
+        with vllm_runner(
+            MODEL,
+            dtype=DTYPE,
+            max_logprobs=7,
+            # Very small number of batched tokens to ensure
+            # that we test chunking.
+            max_num_batched_tokens=16,
+            max_num_seqs=16,
+            max_model_len=128,
+            enable_chunked_prefill=True,
+            enforce_eager=True,
+            # TODO: enable this once we support it for
+            # prompt logprobs.
+            enable_prefix_caching=request.param,
+            gpu_memory_utilization=0.4,
+        ) as vllm_model:
+            yield vllm_model
+    except OSError as exc:
+        _skip_if_model_repo_inaccessible(MODEL, exc)
+        raise
 
 
 @pytest.fixture(scope="module")
 def hf_model(hf_runner) -> Generator[HfRunner, None, None]:
-    with hf_runner(MODEL, dtype=DTYPE) as hf_model:
-        yield hf_model
+    try:
+        with hf_runner(MODEL, dtype=DTYPE) as hf_model:
+            yield hf_model
+    except OSError as exc:
+        _skip_if_model_repo_inaccessible(MODEL, exc)
+        raise
 
 
 def _repeat_logprob_config(
@@ -1059,8 +1084,6 @@ def test_spec_decode_logprobs(
             speculative_config dict, top_logprobs).
         monkeypatch: pytest fixture for setting env vars.
     """
-    from vllm import LLM
-
     # The ROCm skinny GEMM kernels (gemm_kernels.cu) are
     # non-deterministic across LLM instantiations due to persistent
     # workgroup scheduling and wave-level shuffle reductions, which
@@ -1088,8 +1111,8 @@ def test_spec_decode_logprobs(
     max_model_len = 256
 
     # Run base LLM.
-    ref_llm = LLM(
-        model=model_name,
+    ref_llm = _build_llm_or_skip(
+        model_name,
         max_logprobs=5,
         max_model_len=max_model_len,
         seed=42,
@@ -1114,7 +1137,7 @@ def test_spec_decode_logprobs(
     # Run spec decode LLM.
     # Add max_model_len to spec_config if not present
     spec_config_with_len = {**spec_config, "max_model_len": max_model_len}
-    spec_llm = LLM(
+    spec_llm = _build_llm_or_skip(
         model_name,
         speculative_config=spec_config_with_len,
         max_logprobs=5,

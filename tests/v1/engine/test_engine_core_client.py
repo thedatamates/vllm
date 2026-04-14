@@ -52,7 +52,17 @@ if not current_platform.is_cuda_alike():
     )
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
+try:
+    TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
+except OSError as exc:
+    msg = str(exc)
+    if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+            or "repository not found" in msg.lower()):
+        pytest.skip(
+            reason=f"Model repo not accessible in this environment: {MODEL_NAME}",
+            allow_module_level=True,
+        )
+    raise
 PROMPT = "Hello my name is Robert and I love quantization kernels"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 TEST_MODULE = "tests.v1.engine.test_engine_core_client"
