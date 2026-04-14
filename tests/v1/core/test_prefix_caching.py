@@ -154,6 +154,45 @@ def make_kv_cache_config_hybrid_model(
     )
 
 
+def make_kv_cache_config_hybrid_model_mixed_block_sizes(
+    num_blocks: int,
+) -> KVCacheConfig:
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer1"],
+                FullAttentionSpec(
+                    block_size=32,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer2"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer3"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=3 * 16,
+                ),
+            ),
+        ],
+    )
+
+
 def make_kv_cache_config_three_types(
     block_size: int, num_blocks: int, third_spec_type: str = "mamba"
 ) -> KVCacheConfig:
@@ -557,19 +596,25 @@ def test_prefill_hybrid_model_eagle():
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert len(req1.block_hashes) == num_full_blocks
     assert computed_blocks.get_block_ids() == (
-        [1, 2, 3, 4],
-        [0, 9, 10, 11],
-        [0, 16, 17, 18],
+        [1, 2, 3, 4, 5, 6],
+        [0, 0, 10, 11, 12],
+        [0, 0, 17, 18, 19],
     )
-    assert num_computed_tokens == 4 * block_size
+    assert num_computed_tokens == 5 * block_size
+    _assert_group_hit_coverage(
+        manager,
+        computed_blocks,
+        num_computed_tokens,
+        allow_full_headroom=True,
+    )
     num_new_tokens = len(all_token_ids) - num_computed_tokens
     blocks = manager.allocate_slots(
         req1, num_new_tokens, num_computed_tokens, computed_blocks
     )
     assert blocks is not None and blocks.get_block_ids() == (
-        [22, 23, 24],
-        [25, 26, 27],
-        [28, 29, 30],
+        [22],
+        [23, 24],
+        [25, 26],
     )
     for block_per_group in computed_blocks.blocks:
         for block in block_per_group:
@@ -591,7 +636,8 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
         ],
-        4,
+        5,
+        allow_full_headroom=True,
     )
 
     # Evict the first block of full attention, makes total cache miss.
@@ -603,9 +649,10 @@ def test_prefill_hybrid_model_eagle():
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[0], 0)],
         0,
+        allow_full_headroom=True,
     )
 
-    # Evict the last block of all layers, reduces the hit length to 3.
+    # Evict the last block of all layers, reduces the common hit length to 4.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -617,10 +664,12 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[-1], 1),
             make_block_hash_with_group_id(block_hashes[-1], 2),
         ],
-        3,
+        4,
+        allow_full_headroom=True,
     )
 
-    # Evict the last block of full attention, reduces the hit length to 3.
+    # Evicting only the last full-attention block still leaves a 5-block
+    # common frontier; the shorter full-attention group simply loses headroom.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -628,11 +677,13 @@ def test_prefill_hybrid_model_eagle():
         "5",
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-1], 0)],
-        3,
+        5,
+        allow_full_headroom=True,
     )
 
     # Since the last block of full attention is dropped for eagle, evict
-    # the second last block of sliding window, reduces the hit length to 3.
+    # the second last block of sliding window, reduces the common hit length
+    # to 3.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -641,10 +692,12 @@ def test_prefill_hybrid_model_eagle():
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-2], 1)],
         3,
+        allow_full_headroom=True,
     )
 
     # Since the last block of full attention is dropped for eagle, evict
-    # the second last block of sliding window, reduces the hit length to 3.
+    # the second last block of sliding window, reduces the common hit length
+    # to 3.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -653,14 +706,12 @@ def test_prefill_hybrid_model_eagle():
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-2], 2)],
         3,
+        allow_full_headroom=True,
     )
 
-    # Evict different set of blocks for full attention and sliding window makes
-    # total cache miss.
-    # The cache hit length of full attention is 4 * block_size.
-    # The cache hit length of sliding window is 3 * block_size.
-    # Then it is cache miss as the two type of layers
-    # have different hit length.
+    # Different groups can now expose different amounts of reusable prefix
+    # state as long as the scheduler only relies on the shortest common
+    # frontier.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -672,7 +723,77 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
         ],
-        0,
+        5,
+        allow_full_headroom=True,
+    )
+
+
+def test_prefill_hybrid_model_eagle_mixed_block_sizes():
+    hash_block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config_hybrid_model_mixed_block_sizes(40),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    hash_fn = sha256
+
+    num_hash_blocks = 6
+    common_token_ids = [i for i in range(num_hash_blocks) for _ in range(hash_block_size)]
+
+    req0 = make_request(
+        "0",
+        common_token_ids + [6] * 7,
+        hash_block_size,
+        hash_fn,
+    )
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req0,
+        len(common_token_ids) + 7,
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None and blocks.get_block_ids() == (
+        [1, 2, 3, 4],
+        [5, 6, 7, 8, 9, 10, 11],
+        [12, 13, 14, 15, 16, 17, 18],
+    )
+
+    req1 = make_request(
+        "1",
+        common_token_ids + [6] * 5,
+        hash_block_size,
+        hash_fn,
+    )
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+
+    assert num_computed_tokens == 4 * hash_block_size
+    assert computed_blocks.get_block_ids() == (
+        [1, 2, 3],
+        [5, 6, 7, 8, 9, 10],
+        [0, 0, 14, 15],
+    )
+    _assert_group_hit_coverage(
+        manager,
+        computed_blocks,
+        num_computed_tokens,
+        allow_full_headroom=True,
+    )
+
+    blocks = manager.allocate_slots(
+        req1,
+        len(common_token_ids) + 5 - num_computed_tokens,
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None and blocks.get_block_ids() == (
+        [19],
+        [20],
+        [21, 22, 23],
     )
 
 
@@ -684,6 +805,7 @@ def _test_partial_request_hit(
     prompt_token_ids: list[int],
     hash_to_evict: list[BlockHashWithGroupId],
     expect_hit_length: int,
+    allow_full_headroom: bool = False,
 ):
     cached_block_hash_to_block_bak = copy.copy(
         manager.block_pool.cached_block_hash_to_block._cache
@@ -694,13 +816,32 @@ def _test_partial_request_hit(
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
     assert len(req.block_hashes) == num_full_blocks
     assert num_computed_tokens == expect_hit_length * block_size
-    for block_per_group in computed_blocks.blocks:
-        assert len(block_per_group) == num_computed_tokens // block_size
+    _assert_group_hit_coverage(
+        manager,
+        computed_blocks,
+        num_computed_tokens,
+        allow_full_headroom=allow_full_headroom,
+    )
     for hash_with_group_id in hash_to_evict:
         manager.block_pool.cached_block_hash_to_block._cache[hash_with_group_id] = (
             cached_block_hash_to_block_bak[hash_with_group_id]
         )
     manager.free(req)
+
+
+def _assert_group_hit_coverage(
+    manager: KVCacheManager,
+    computed_blocks,
+    num_computed_tokens: int,
+    allow_full_headroom: bool = False,
+) -> None:
+    for spec, group_ids, _ in manager.coordinator.attention_groups:
+        for group_id in group_ids:
+            group_hit_tokens = len(computed_blocks.blocks[group_id]) * spec.block_size
+            if allow_full_headroom and isinstance(spec, FullAttentionSpec):
+                assert group_hit_tokens >= num_computed_tokens
+            else:
+                assert group_hit_tokens == num_computed_tokens
 
 
 def _make_hybrid_kv_cache_config(
@@ -893,7 +1034,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
 # - 2 groups: 1 full + 1 other
 _EAGLE_HYBRID_MODEL_TEST_CASES = [
     # 2 groups: 1 full + 1 other
-    pytest.param(["full", "sliding_window"], 2, id="2g-full+sw"),
+    pytest.param(["full", "sliding_window"], 3, id="2g-full+sw"),
 ]
 
 
@@ -902,8 +1043,8 @@ def test_prefill_hybrid_model_combinations_eagle(
     spec_types: list[str], expect_hit_length: int
 ):
     """
-    Test prefix caching with hybrid models (1 full attn + 1 other) with EAGLE.
-    More complex hybrid models with EAGLE are not yet supported (see issue #32802).
+    Test prefix caching with a simple hybrid model (1 full attn + 1 other)
+    with EAGLE.
     """
     block_size = 16
     num_groups = len(spec_types)
@@ -950,9 +1091,12 @@ def test_prefill_hybrid_model_combinations_eagle(
     # Should hit cached blocks for all groups
     assert num_computed_tokens == expect_hit_length * block_size
     assert len(computed_blocks.blocks) == num_groups
-    # Verify each group has the correct number of computed blocks
-    for block_per_group in computed_blocks.blocks:
-        assert len(block_per_group) == expect_hit_length
+    _assert_group_hit_coverage(
+        manager,
+        computed_blocks,
+        num_computed_tokens,
+        allow_full_headroom=True,
+    )
 
     # Allocate and verify blocks for second request
     blocks = manager.allocate_slots(

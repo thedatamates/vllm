@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
@@ -456,12 +457,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
-        Find the longest cache hit using an iterative fixed-point algorithm.
+        Find the longest cache hit for hybrid models.
 
-        Each attention type either accepts the current candidate length or
-        reduces it. If any type reduces the length, restart checks over all
-        types. This converges because length monotonically decreases and is
-        bounded below by 0.
+        Most hybrid models still use the legacy fixed-point algorithm to find
+        a single cache-hit frontier that is valid for every KV cache group.
+        When EAGLE is enabled and the only extra headroom comes from full
+        attention groups, we can safely preserve those longer full-attention
+        block tables while still reporting the shorter common frontier back to
+        the scheduler. This avoids returning an invalid common hit length for
+        sliding-window groups on Gemma4-like hybrids.
 
         Args:
             block_hashes: The block hashes of the request.
@@ -480,16 +484,68 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
+        def _find_group_cache_hit(
+            spec: KVCacheSpec,
+            group_ids: list[int],
+            manager_cls: type[SingleTypeKVCacheManager],
+            max_length: int,
+        ) -> tuple[list[KVCacheBlock], ...]:
+            return manager_cls.find_longest_cache_hit(
+                block_hashes=_get_block_hashes(spec),
+                max_length=max_length,
+                kv_cache_group_ids=group_ids,
+                block_pool=self.block_pool,
+                kv_cache_spec=spec,
+                use_eagle=self.use_eagle
+                and isinstance(spec, SlidingWindowSpec),
+                alignment_tokens=self.lcm_block_size,
+            )
+
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
-        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
-        # Simple hybrid (1 full attn + 1 other): one iteration suffices.
-        # Full attn is always first if it exists. This avoids EAGLE drops
-        # being applied multiple times to non-full-attn groups.
-        # FIXME (yifan): However, for complex hybrid models with multiple attn
-        # groups, we still have the EAGLE spiral block dropping problem. See
-        # discussion in issue https://github.com/vllm-project/vllm/issues/32802.
+        # Fast path for EAGLE hybrids where only full-attention groups have
+        # extra reusable headroom. In that case, we can preserve the longer
+        # full-attention block tables and report the shortest common hit length
+        # back to the scheduler without forcing every group to share one block
+        # count.
+        if self.use_eagle and any(
+            isinstance(spec, FullAttentionSpec)
+            for spec, _, _ in self.attention_groups
+        ):
+            hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
+            group_hit_lengths: list[int] = []
+            group_is_full_attention: list[bool] = []
+
+            for spec, group_ids, manager_cls in self.attention_groups:
+                is_full_attn = isinstance(spec, FullAttentionSpec)
+                # Probe each group independently at the full candidate length.
+                # If only full-attention groups extend past the shortest common
+                # frontier, we can preserve that extra headroom without
+                # changing the scheduler-visible hit length.
+                hit_blocks = _find_group_cache_hit(
+                    spec, group_ids, manager_cls, max_cache_hit_length
+                )
+                for group_id, blocks in zip(group_ids, hit_blocks):
+                    hit_blocks_by_group[group_id] = blocks
+                group_hit_lengths.append(len(hit_blocks[0]) * spec.block_size)
+                group_is_full_attention.append(is_full_attn)
+
+            common_hit_length = min(group_hit_lengths)
+            only_full_attention_groups_extend = all(
+                is_full_attn or group_hit_length == common_hit_length
+                for is_full_attn, group_hit_length in zip(
+                    group_is_full_attention, group_hit_lengths
+                )
+            )
+            if only_full_attention_groups_extend:
+                return tuple(
+                    blocks if blocks is not None else []
+                    for blocks in hit_blocks_by_group
+                ), common_hit_length
+
+        # Legacy fixed-point path: all groups must agree on a single hit length.
+        hit_blocks_by_group = [None] * num_groups
         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
             self.attention_groups[0][0], FullAttentionSpec
         )
@@ -500,25 +556,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
 
-                # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if is_full_attn and cached_blocks is not None:
-                    # For full attention, we only need to compute the cache hit
-                    # length once. Starting from the second iteration, if the
-                    # curr_hit_length is reduced by other groups, we can simply
-                    # keep the first (curr_hit_length // block_size) blocks from
-                    # the last iteration.
                     num_blocks = curr_hit_length // spec.block_size
                     curr_hit_length = num_blocks * spec.block_size
                 else:
-                    hit_blocks = manager_cls.find_longest_cache_hit(
-                        block_hashes=_get_block_hashes(spec),
-                        max_length=curr_hit_length,
-                        kv_cache_group_ids=group_ids,
-                        block_pool=self.block_pool,
-                        kv_cache_spec=spec,
-                        use_eagle=self.use_eagle,
-                        alignment_tokens=self.lcm_block_size,
+                    hit_blocks = _find_group_cache_hit(
+                        spec, group_ids, manager_cls, curr_hit_length
                     )
                     curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
@@ -527,11 +571,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
-            # Simple hybrid: exit after one iteration
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
         spec, group_ids, _ = self.attention_groups[0]
         if isinstance(spec, FullAttentionSpec):
             num_blocks = hit_length // spec.block_size
@@ -539,9 +581,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
-        return tuple(
+        result = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
-        ), hit_length
+        )
+        return result, hit_length
 
 
 def get_kv_cache_coordinator(
