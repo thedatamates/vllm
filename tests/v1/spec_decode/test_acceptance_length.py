@@ -65,9 +65,13 @@ EAGLE3_MODEL_CONFIGS = [
         expected_acceptance_length=2.56,
         expected_acceptance_lengths_per_pos=[0.7165, 0.5120, 0.3337],
         id="gpt-oss-20b-eagle3",
-        # FLASHINFER incompatible: gpt-oss-20b uses sink attention which
-        # FLASHINFER does not support ("sink setting not supported")
-        excluded_backends={AttentionBackendEnum.FLASHINFER},
+        # GPT-OSS uses attention sinks, which are not supported by
+        # FLASHINFER ("sink setting not supported") or FLASH_ATTN
+        # ("attention sinks not supported").
+        excluded_backends={
+            AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.FLASH_ATTN,
+        },
     ),
     Eagle3ModelConfig(
         verifier="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
