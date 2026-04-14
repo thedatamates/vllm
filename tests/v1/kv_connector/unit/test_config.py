@@ -5,6 +5,7 @@
 
 import pytest
 
+from vllm.config import parallel as parallel_config_module
 from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
 
 pytestmark = pytest.mark.cpu_test
@@ -24,8 +25,20 @@ pytestmark = pytest.mark.cpu_test
     ],
 )
 def test_kv_connector(
-    kv_offloading_backend, kv_offloading_size, tp, pp, expected_backend, expected_bytes
+    kv_offloading_backend,
+    kv_offloading_size,
+    tp,
+    pp,
+    expected_backend,
+    expected_bytes,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setattr(
+        parallel_config_module.current_platform,
+        "device_count",
+        lambda: tp * pp,
+    )
+
     kv_transfer_config = (
         KVTransferConfig(kv_connector_extra_config={"existing_key": "existing_value"})
         if expected_backend is not None

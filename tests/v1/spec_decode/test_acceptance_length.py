@@ -65,9 +65,13 @@ EAGLE3_MODEL_CONFIGS = [
         expected_acceptance_length=2.56,
         expected_acceptance_lengths_per_pos=[0.7165, 0.5120, 0.3337],
         id="gpt-oss-20b-eagle3",
-        # FLASHINFER incompatible: gpt-oss-20b uses sink attention which
-        # FLASHINFER does not support ("sink setting not supported")
-        excluded_backends={AttentionBackendEnum.FLASHINFER},
+        # GPT-OSS uses attention sinks, which are not supported by
+        # FLASHINFER ("sink setting not supported") or FLASH_ATTN
+        # ("attention sinks not supported").
+        excluded_backends={
+            AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.FLASH_ATTN,
+        },
     ),
     Eagle3ModelConfig(
         verifier="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
@@ -154,7 +158,9 @@ def get_mt_bench_prompts(
         num_prompts=num_prompts,
         seed=42,
         no_oversample=False,
+        backend="openai-chat",
         endpoint_type="openai-chat",
+        enable_multimodal_chat=False,
         input_len=None,
         output_len=DEFAULT_OUTPUT_LEN,
         sharegpt_output_len=DEFAULT_OUTPUT_LEN,
@@ -165,6 +171,8 @@ def get_mt_bench_prompts(
         no_stream=True,
         disable_shuffle=False,
         skip_chat_template=False,
+        trust_remote_code=False,
+        request_id_prefix="",
     )
     samples = get_samples(args, tokenizer)
     prompt_ids = [

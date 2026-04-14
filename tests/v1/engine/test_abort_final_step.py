@@ -204,6 +204,7 @@ async def test_abort_during_final_step(async_scheduling: bool):
             kv_transfer_config = KVTransferConfig(
                 kv_connector="DummyKVConnector",
                 kv_role="kv_both",
+                kv_connector_module_path=__name__,
                 kv_connector_extra_config={"status_file": str(status_file)},
             )
             engine_args = AsyncEngineArgs(
