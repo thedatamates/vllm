@@ -212,7 +212,7 @@ def test_engine_metrics(vllm_runner, example_prompts):
         assert len(num_accepted_tokens_per_pos[0].values) == 5
 
 
-@pytest.mark.parametrize("model", ["meta-llama/Llama-3.2-1B-Instruct"])
+@pytest.mark.parametrize("model", ["facebook/opt-125m"])
 def test_skip_tokenizer_initialization(model: str):
     # This test checks if the flag skip_tokenizer_init skips the initialization
     # of tokenizer and detokenizer. The generated output is expected to contain

@@ -207,7 +207,7 @@ async def test_abort_during_final_step(async_scheduling: bool):
                 kv_connector_extra_config={"status_file": str(status_file)},
             )
             engine_args = AsyncEngineArgs(
-                model="meta-llama/Llama-3.2-1B-Instruct",
+                model="facebook/opt-125m",
                 enforce_eager=True,
                 async_scheduling=async_scheduling,
                 kv_transfer_config=kv_transfer_config,
