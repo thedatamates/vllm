@@ -38,6 +38,18 @@ PROMPTS = [
 SAMPLING_PARAMS = SamplingParams(temperature=0, max_tokens=20)
 
 
+def _build_llm_or_skip(**kwargs) -> LLM:
+    try:
+        return LLM(**kwargs)
+    except OSError as exc:
+        msg = str(exc)
+        model = kwargs.get("model", "<unknown>")
+        if ("gated repo" in msg.lower() or "not a valid model identifier" in msg
+                or "repository not found" in msg.lower()):
+            pytest.skip(f"Model repo not accessible in this environment: {model}")
+        raise
+
+
 # Test connector with custom stats for testing MultiConnector
 class MockConnectorStats(KVConnectorStats):
     """Mock stats class for testing."""
@@ -175,7 +187,7 @@ def test_multi_example_connector_consistency():
         },
     )
 
-    llm = LLM(
+    llm = _build_llm_or_skip(
         model=MODEL_NAME,
         enforce_eager=True,
         gpu_memory_utilization=0.5,

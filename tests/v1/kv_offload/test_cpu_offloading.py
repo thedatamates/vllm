@@ -34,6 +34,17 @@ _FIRST_EVENT_POLL_MS = 10_000 if current_platform.is_rocm() else 1000
 _EVENT_DRAIN_TIMEOUT = 60
 
 
+def _build_llm_or_skip(**kwargs) -> LLM:
+    model = kwargs.get("model", "<unknown>")
+    try:
+        return LLM(**kwargs)
+    except OSError as exc:
+        msg = str(exc).lower()
+        if "gated repo" in msg or "access to model" in msg:
+            pytest.skip(f"Skipping inaccessible model repo {model}: {exc}")
+        raise
+
+
 class MockSubscriber:
     """Helper class to receive and verify published events"""
 
@@ -216,7 +227,7 @@ def test_cpu_offloading(cpu_block_size: int, attn_backend: str) -> None:
         topic="test",
     )
 
-    llm = LLM(
+    llm = _build_llm_or_skip(
         model="meta-llama/Llama-3.2-1B-Instruct",
         gpu_memory_utilization=0.5,
         kv_events_config=kv_events_config,

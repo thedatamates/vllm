@@ -49,6 +49,16 @@ except ImportError:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
 
 
+def _build_model_config_or_skip(model: str, **kwargs) -> ModelConfig:
+    try:
+        return ModelConfig(model=model, **kwargs)
+    except OSError as exc:
+        msg = str(exc)
+        if "gated repo" in msg.lower() or "access to model" in msg.lower():
+            pytest.skip(f"Skipping inaccessible model repo {model}: {exc}")
+        raise
+
+
 def _convert_dtype_to_torch(dtype):
     """Convert ModelDType to torch.dtype."""
     if isinstance(dtype, str):
@@ -665,7 +675,9 @@ def test_sliding_window_backend_correctness(
         return causal_mask & window_mask
 
     batch_spec = BATCH_SPECS[batch_spec_name]
-    model_config = ModelConfig(model=model, max_model_len=max(batch_spec.seq_lens))
+    model_config = _build_model_config_or_skip(
+        model, max_model_len=max(batch_spec.seq_lens)
+    )
     sliding_window = model_config.get_sliding_window()
     sliding_window_mask_mod_fn = partial(
         sliding_window_mask_mod, sliding_window=sliding_window
@@ -725,7 +737,9 @@ def test_sliding_window_encoder_backend_correctness(
         return torch.abs(q_idx + context_len - kv_idx) < sliding_window
 
     batch_spec = BATCH_SPECS[batch_spec_name]
-    model_config = ModelConfig(model=model, max_model_len=max(batch_spec.seq_lens))
+    model_config = _build_model_config_or_skip(
+        model, max_model_len=max(batch_spec.seq_lens)
+    )
     sliding_window = model_config.get_sliding_window()
     sliding_window_mask_mod_fn = partial(
         bidi_sliding_window_mask_mod, sliding_window=sliding_window

@@ -14,6 +14,7 @@ from tests.v1.engine.utils import (
     DummyOutputProcessorTestVectors,
     generate_dummy_prompt_logprobs_tensors,
     generate_dummy_sample_logprobs,
+    skip_if_model_repo_inaccessible,
 )
 from vllm.engine.arg_utils import EngineArgs
 
@@ -30,8 +31,12 @@ def _build_test_vectors_no_logprobs() -> DummyOutputProcessorTestVectors:
       DummyOutputProcessorTestVectors instance with no logprobs
     """
 
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    vllm_config = EngineArgs(model=TOKENIZER_NAME).create_engine_config()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+        vllm_config = EngineArgs(model=TOKENIZER_NAME).create_engine_config()
+    except OSError as exc:
+        skip_if_model_repo_inaccessible(TOKENIZER_NAME, exc)
+        raise
     # Tokenize prompts under test & create dummy generated tokens
     prompt_tokens = [tokenizer(text).input_ids[:PROMPT_LEN] for text in FULL_STRINGS]
     generation_tokens = [

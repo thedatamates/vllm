@@ -11,7 +11,12 @@ PROMPT = "Hello my name is Robert and I"
 
 @pytest.fixture(scope="module")
 def llm() -> LLM:
-    return LLM(MODEL, enforce_eager=True)
+    return LLM(
+        MODEL,
+        enforce_eager=True,
+        max_model_len=256,
+        gpu_memory_utilization=0.2,
+    )
 
 
 def test_n_gt_1(llm):
