@@ -154,7 +154,9 @@ def get_mt_bench_prompts(
         num_prompts=num_prompts,
         seed=42,
         no_oversample=False,
+        backend="openai-chat",
         endpoint_type="openai-chat",
+        enable_multimodal_chat=False,
         input_len=None,
         output_len=DEFAULT_OUTPUT_LEN,
         sharegpt_output_len=DEFAULT_OUTPUT_LEN,
@@ -165,6 +167,8 @@ def get_mt_bench_prompts(
         no_stream=True,
         disable_shuffle=False,
         skip_chat_template=False,
+        trust_remote_code=False,
+        request_id_prefix="",
     )
     samples = get_samples(args, tokenizer)
     prompt_ids = [
