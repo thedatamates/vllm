@@ -711,6 +711,17 @@ def test_backend_correctness(
     ) and AttentionBackendEnum.CUTLASS_MLA in backends_to_test:
         # CUTLASS_MLA does not support non-1 Q/K scales
         backends_to_test.remove(AttentionBackendEnum.CUTLASS_MLA)
+    device_capability = current_platform.get_device_capability()
+    if (
+        device_capability is not None
+        and device_capability.major >= 12
+        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        and AttentionBackendEnum.TRITON_MLA in backends_to_test
+    ):
+        # On Blackwell, Triton MLA decode currently requests 102400 bytes of
+        # shared memory for these FP8 cases, which exceeds the 101376-byte
+        # limit on SM120/SM121 and fails at launch time.
+        backends_to_test.remove(AttentionBackendEnum.TRITON_MLA)
     if not backends_to_test:
         pytest.skip(f"No backends support kv_cache_dtype={kv_cache_dtype}")
 
