@@ -38,6 +38,8 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
+from .utils import skip_if_model_repo_inaccessible
+
 if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.", allow_module_level=True)
 
@@ -204,17 +206,22 @@ async def test_abort_during_final_step(async_scheduling: bool):
             kv_transfer_config = KVTransferConfig(
                 kv_connector="DummyKVConnector",
                 kv_role="kv_both",
+                kv_connector_module_path=__name__,
                 kv_connector_extra_config={"status_file": str(status_file)},
             )
             engine_args = AsyncEngineArgs(
-                model="meta-llama/Llama-3.2-1B-Instruct",
+                model="facebook/opt-125m",
                 enforce_eager=True,
                 async_scheduling=async_scheduling,
                 kv_transfer_config=kv_transfer_config,
             )
 
             with set_default_torch_num_threads(1):
-                engine = AsyncLLM.from_engine_args(engine_args)
+                try:
+                    engine = AsyncLLM.from_engine_args(engine_args)
+                except OSError as exc:
+                    skip_if_model_repo_inaccessible(engine_args.model, exc)
+                    raise
 
             try:
                 # Create a request that will complete after just 1 token

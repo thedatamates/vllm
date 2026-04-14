@@ -36,7 +36,7 @@ if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.", allow_module_level=True)
 
 TEXT_ENGINE_ARGS = AsyncEngineArgs(
-    model="meta-llama/Llama-3.2-1B-Instruct",
+    model="Qwen/Qwen2.5-0.5B-Instruct",
     enforce_eager=True,
 )
 

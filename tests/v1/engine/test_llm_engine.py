@@ -9,6 +9,8 @@ from vllm import LLM
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Metric, Vector
 
+from .utils import skip_if_model_repo_inaccessible
+
 if TYPE_CHECKING:
     from tests.conftest import VllmRunner
 else:
@@ -212,16 +214,20 @@ def test_engine_metrics(vllm_runner, example_prompts):
         assert len(num_accepted_tokens_per_pos[0].values) == 5
 
 
-@pytest.mark.parametrize("model", ["meta-llama/Llama-3.2-1B-Instruct"])
+@pytest.mark.parametrize("model", ["facebook/opt-125m"])
 def test_skip_tokenizer_initialization(model: str):
     # This test checks if the flag skip_tokenizer_init skips the initialization
     # of tokenizer and detokenizer. The generated output is expected to contain
     # token ids.
-    llm = LLM(
-        model=model,
-        skip_tokenizer_init=True,
-        enforce_eager=True,
-    )
+    try:
+        llm = LLM(
+            model=model,
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+        )
+    except OSError as exc:
+        skip_if_model_repo_inaccessible(model, exc)
+        raise
     sampling_params = SamplingParams(prompt_logprobs=True, detokenize=True)
 
     with pytest.raises(ValueError, match="`skip_tokenizer_init=True`"):

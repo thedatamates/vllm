@@ -28,6 +28,7 @@ def mock_model_runner_with_input_batch():
     runner.requests = {}
     runner.max_num_reqs = 10
     runner.max_model_len = 1024
+    runner.late_interaction_runner = Mock()
 
     # Create a real InputBatch for e2e testing
     runner.input_batch = InputBatch(
@@ -115,6 +116,11 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
 
     # Verify request was removed from InputBatch during update (avoids duplication)
     assert req_id not in runner.input_batch.req_id_to_index
+
+    # Verify late interaction state is re-registered for the updated request.
+    runner.late_interaction_runner.register_request.assert_called_once_with(
+        req_id, None
+    )
 
 
 def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_batch):
@@ -208,3 +214,8 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
 
     # Verify request was removed from InputBatch during update (avoids duplication)
     assert req_id not in runner.input_batch.req_id_to_index
+
+    # Verify late interaction state is re-registered for the updated request.
+    runner.late_interaction_runner.register_request.assert_called_once_with(
+        req_id, None
+    )

@@ -465,7 +465,7 @@ def test_engine_core_invalid_request_id_type():
     assert len(engine_core.scheduler.running) == 0
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize(
     ("ec_role", "gpu_memory_utilization", "enable_prefix_caching"),
     [
