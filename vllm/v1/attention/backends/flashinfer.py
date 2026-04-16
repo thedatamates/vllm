@@ -622,6 +622,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
                 # which is passed to FlashInferImpl
                 self.kv_cache_dtype = self.cache_dtype
+                raise NotImplementedError("nvfp4 KV cache is not yet supported")
             else:
                 self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                     self.cache_dtype
