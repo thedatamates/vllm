@@ -16,6 +16,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import set_current_vllm_config
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim, set_random_seed
 from vllm.v1.attention.backends.utils import (
@@ -25,16 +26,22 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
-if not current_platform.is_device_capability_family(100):
+capability = current_platform.get_device_capability()
+if not (
+    current_platform.is_device_capability_family(100)
+    or capability in (DeviceCapability(12, 0), DeviceCapability(12, 1))
+):
     pytest.skip(
-        "TRTLLM integration tests require NVIDIA Blackwell (SM100).",
+        "TRTLLM integration tests require NVIDIA Blackwell (SM100/SM120/SM121).",
         allow_module_level=True,
     )
 
 from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
+    FIPrefill,
     FlashInferImpl,
     FlashInferMetadataBuilder,
     TRTLLMDecode,
+    TRTLLMFMHAv2Prefill,
     TRTLLMPrefill,
 )
 
@@ -293,6 +300,8 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
     )
     vllm_config.attention_config.use_trtllm_attention = True
     vllm_config.cache_config.cache_dtype = kv_cache_dtype
+    if kv_cache_dtype == "nvfp4":
+        vllm_config.attention_config.use_flashinfer_sm120_nvfp4_prefill = True
 
     num_q_heads = vllm_config.model_config.get_num_attention_heads(
         vllm_config.parallel_config
@@ -429,11 +438,32 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
             # Verify the correct TRTLLM metadata types were produced.
             has_prefills = any(ql > 1 for ql in batch_spec.query_lens)
             has_decodes = any(ql == 1 for ql in batch_spec.query_lens)
+            sm12x = capability in (
+                DeviceCapability(12, 0),
+                DeviceCapability(12, 1),
+            )
 
             if has_prefills:
-                assert isinstance(attn_metadata.prefill, TRTLLMPrefill), (
-                    f"Expected TRTLLMPrefill, got {type(attn_metadata.prefill)}"
-                )
+                if sm12x and kv_cache_dtype == "nvfp4":
+                    assert isinstance(attn_metadata.prefill, FIPrefill), (
+                        f"Expected FIPrefill, got {type(attn_metadata.prefill)}"
+                    )
+                    wrapper_backend = getattr(
+                        attn_metadata.prefill.wrapper, "_backend", None
+                    )
+                    if max(batch_spec.query_lens) >= 128:
+                        assert wrapper_backend == "sm120-nvfp4"
+                    else:
+                        assert wrapper_backend != "sm120-nvfp4"
+                elif sm12x and kv_cache_dtype == "auto":
+                    assert isinstance(attn_metadata.prefill, TRTLLMFMHAv2Prefill), (
+                        f"Expected TRTLLMFMHAv2Prefill, got "
+                        f"{type(attn_metadata.prefill)}"
+                    )
+                elif not sm12x:
+                    assert isinstance(attn_metadata.prefill, TRTLLMPrefill), (
+                        f"Expected TRTLLMPrefill, got {type(attn_metadata.prefill)}"
+                    )
             if has_decodes:
                 assert isinstance(attn_metadata.decode, TRTLLMDecode), (
                     f"Expected TRTLLMDecode, got {type(attn_metadata.decode)}"
@@ -460,6 +490,12 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                 mock_layer._v_scale = kv_scale_t
                 mock_layer._k_scale_float = kv_scale_val
                 mock_layer._v_scale_float = kv_scale_val
+            else:
+                scale_t = torch.tensor(1.0, dtype=torch.float32, device=device)
+                mock_layer._k_scale = scale_t
+                mock_layer._v_scale = scale_t
+                mock_layer._k_scale_float = 1.0
+                mock_layer._v_scale_float = 1.0
             output = torch.empty_like(query_vllm)
 
             impl.do_kv_cache_update(
@@ -470,10 +506,10 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                 attn_metadata.slot_mapping,
             )
 
-            # nvfp4 trtllm kernel requires FP8 queries. In the real
-            # pipeline the attention layer handles this; here we
-            # quantize manually.
-            if is_nvfp4:
+            # SM100 TRTLLM-gen NVFP4 uses FP8 queries. SM120/SM121 XQA
+            # accepts model-dtype queries, so follow the metadata contract
+            # instead of keying only off the KV cache dtype.
+            if is_nvfp4 and attn_metadata.q_data_type == current_platform.fp8_dtype():
                 finfo = torch.finfo(torch.float8_e4m3fn)
                 q_amax = query_vllm.abs().amax().clamp(min=1e-12)
                 q_s = (finfo.max / q_amax * 0.1).item()
@@ -534,3 +570,147 @@ def test_trtllm_gen_nvfp4_kv_integration(batch_spec_name: str):
         kv_cache_dtype="nvfp4",
         model_name=MODEL_NVFP4,
     )
+
+
+@torch.inference_mode()
+def test_sm12x_fmha_v2_prefill_does_not_select_head_dim_512():
+    """FMHAv2 SM12x paged prefill is not correctness-valid for 512-wide heads."""
+    sm12x = capability in (DeviceCapability(12, 0), DeviceCapability(12, 1))
+    if not sm12x:
+        pytest.skip("SM12x-only FMHAv2 selection check")
+
+    batch_spec = BATCH_SPECS["prefill_only"]
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    vllm_config = create_vllm_config(
+        model_name=MODEL,
+        max_model_len=max(batch_spec.seq_lens),
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=NUM_GPU_BLOCKS,
+    )
+    vllm_config.attention_config.use_trtllm_attention = True
+    common_attn_metadata = create_common_attn_metadata(batch_spec, BLOCK_SIZE, device)
+
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    kv_cache_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=num_kv_heads,
+        head_size=512,
+        dtype=vllm_config.model_config.dtype,
+        kv_quant_mode=KVQuantMode.NONE,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        unittest.mock.patch(
+            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            _mock_get_per_layer_parameters,
+        ),
+    ):
+        builder = FlashInferMetadataBuilder(
+            kv_cache_spec, ["test_layer_0"], vllm_config, device
+        )
+        attn_metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    assert not isinstance(attn_metadata.prefill, TRTLLMFMHAv2Prefill)
+
+
+@torch.inference_mode()
+def test_sm12x_nvfp4_large_prefill_selects_sm120_wrapper():
+    sm12x = capability in (DeviceCapability(12, 0), DeviceCapability(12, 1))
+    if not sm12x:
+        pytest.skip("SM12x-only SM120 NVFP4 selection check")
+
+    batch_spec = BatchSpec(seq_lens=[256], query_lens=[128])
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    vllm_config = create_vllm_config(
+        model_name=MODEL_NVFP4,
+        max_model_len=max(batch_spec.seq_lens),
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=NUM_GPU_BLOCKS,
+    )
+    vllm_config.cache_config.cache_dtype = "nvfp4"
+    vllm_config.attention_config.use_flashinfer_sm120_nvfp4_prefill = True
+    common_attn_metadata = create_common_attn_metadata(batch_spec, BLOCK_SIZE, device)
+
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    kv_cache_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        unittest.mock.patch(
+            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            _mock_get_per_layer_parameters,
+        ),
+    ):
+        builder = FlashInferMetadataBuilder(
+            kv_cache_spec, ["test_layer_0"], vllm_config, device
+        )
+        attn_metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    assert isinstance(attn_metadata.prefill, FIPrefill)
+    assert getattr(attn_metadata.prefill.wrapper, "_backend", None) == "sm120-nvfp4"
+
+
+@torch.inference_mode()
+def test_sm12x_nvfp4_large_prefill_does_not_select_sm120_wrapper_by_default():
+    sm12x = capability in (DeviceCapability(12, 0), DeviceCapability(12, 1))
+    if not sm12x:
+        pytest.skip("SM12x-only SM120 NVFP4 selection check")
+
+    batch_spec = BatchSpec(seq_lens=[256], query_lens=[128])
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    vllm_config = create_vllm_config(
+        model_name=MODEL_NVFP4,
+        max_model_len=max(batch_spec.seq_lens),
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=NUM_GPU_BLOCKS,
+    )
+    vllm_config.cache_config.cache_dtype = "nvfp4"
+    common_attn_metadata = create_common_attn_metadata(batch_spec, BLOCK_SIZE, device)
+
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    kv_cache_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        unittest.mock.patch(
+            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            _mock_get_per_layer_parameters,
+        ),
+    ):
+        builder = FlashInferMetadataBuilder(
+            kv_cache_spec, ["test_layer_0"], vllm_config, device
+        )
+        attn_metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    assert isinstance(attn_metadata.prefill, FIPrefill)
+    assert getattr(attn_metadata.prefill.wrapper, "_backend", None) != "sm120-nvfp4"

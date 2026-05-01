@@ -20,6 +20,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 
 logger = init_logger(__name__)
 
@@ -298,17 +299,22 @@ def has_nvidia_artifactory() -> bool:
 @functools.cache
 def supports_trtllm_attention() -> bool:
     """
-    TRTLLM attention is supported if the platform is SM100,
-    NVIDIA artifactory is accessible, and batch-invariant mode is not enabled.
+    TRTLLM attention is supported when batch-invariant mode is disabled and
+    FlashInfer has a usable backend for the current Blackwell target.
+
+    SM100 uses prebuilt cubins from NVIDIA artifactory. SM120/SM121 use
+    FlashInfer's JIT XQA path for Blackwell workstation parts.
     """
     # Batch-invariant mode disables TRTLLM attention
     if envs.VLLM_BATCH_INVARIANT:
         return False
 
-    # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
-    return (
-        current_platform.is_device_capability_family(100) and has_nvidia_artifactory()
-    )
+    capability = current_platform.get_device_capability()
+    if capability in (DeviceCapability(12, 0), DeviceCapability(12, 1)):
+        return True
+
+    # SM100 requires NVIDIA artifactory to be accessible to download cubins.
+    return current_platform.is_device_capability_family(100) and has_nvidia_artifactory()
 
 
 def force_use_trtllm_attention() -> bool | None:
@@ -377,6 +383,17 @@ def use_trtllm_attention(
                 "TRTLLM attention is not supported for this combination of "
                 "query and key heads, but --attention-config.use_trtllm_attention is "
                 "set to 1"
+            )
+        return False
+
+    if is_prefill and current_platform.get_device_capability() in (
+        DeviceCapability(12, 0),
+        DeviceCapability(12, 1),
+    ):
+        if force_use_trtllm:
+            logger.warning_once(
+                "TRTLLM prefill attention is not supported on SM120/SM121; "
+                "using native FlashInfer prefill."
             )
         return False
 

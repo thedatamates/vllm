@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -44,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -107,7 +109,9 @@ def new_kv_cache_spec(
     block_size=16,
     num_kv_heads=2,
     head_size=64,
+    head_size_v=None,
     dtype=torch.float32,
+    kv_quant_mode=KVQuantMode.NONE,
     page_size_padded=None,
     sliding_window=None,
     attention_chunk_size=None,
@@ -116,7 +120,9 @@ def new_kv_cache_spec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        head_size_v=head_size_v,
         dtype=dtype,
+        kv_quant_mode=kv_quant_mode,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
         attention_chunk_size=attention_chunk_size,
@@ -127,7 +133,9 @@ def new_sliding_window_spec(
     block_size=16,
     num_kv_heads=2,
     head_size=64,
+    head_size_v=None,
     dtype=torch.float32,
+    kv_quant_mode=KVQuantMode.NONE,
     page_size_padded=None,
     sliding_window=1,
 ):
@@ -135,7 +143,9 @@ def new_sliding_window_spec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        head_size_v=head_size_v,
         dtype=dtype,
+        kv_quant_mode=kv_quant_mode,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
     )
@@ -1739,6 +1749,42 @@ def test_get_kv_cache_config_one_worker():
             KVCacheGroupSpec(
                 ["layer_2"], new_sliding_window_spec(head_size=32, block_size=32)
             ),
+        ],
+    )
+
+    # Mixed full + sliding-window NVFP4 attention, as in Gemma4: global
+    # full-attention layers use a larger head dim than sliding-window layers.
+    full_nvfp4_spec = new_kv_cache_spec(
+        head_size=512,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+    )
+    sliding_nvfp4_spec = new_sliding_window_spec(
+        head_size=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+    )
+    assert full_nvfp4_spec.page_size_bytes == 2 * sliding_nvfp4_spec.page_size_bytes
+    kv_cache_specs_hybrid = {
+        "layer_1": full_nvfp4_spec,
+        "layer_2": sliding_nvfp4_spec,
+    }
+    kv_cache_config_hybrid = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs_hybrid],
+        [full_nvfp4_spec.page_size_bytes * 32],
+    )[0]
+    assert kv_cache_config_hybrid == KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=full_nvfp4_spec.page_size_bytes * 32,
+                shared_by=["layer_1", "layer_2"],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_1"], full_nvfp4_spec),
+            KVCacheGroupSpec(["layer_2"], replace(sliding_nvfp4_spec, block_size=32)),
         ],
     )
 

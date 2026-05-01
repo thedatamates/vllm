@@ -14,6 +14,9 @@ from vllm.config import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
+from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 # CudaPlatform and RocmPlatform import their respective compiled C extensions
 # at module level, raising ModuleNotFoundError on incompatible builds.
@@ -29,6 +32,34 @@ except (ImportError, ModuleNotFoundError):
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+
+
+def test_supports_trtllm_attention_on_sm120_without_artifactory():
+    from vllm.utils import flashinfer as flashinfer_utils
+
+    class FakeSM120Platform:
+        @staticmethod
+        def get_device_capability(device_id: int = 0):
+            return DeviceCapability(12, 0)
+
+        @staticmethod
+        def is_device_capability_family(capability: int, device_id: int = 0):
+            return False
+
+    flashinfer_utils.supports_trtllm_attention.cache_clear()
+    try:
+        with (
+            patch.object(flashinfer_utils, "current_platform", FakeSM120Platform()),
+            patch.object(flashinfer_utils.envs, "VLLM_BATCH_INVARIANT", False),
+            patch.object(
+                flashinfer_utils,
+                "has_nvidia_artifactory",
+                side_effect=AssertionError("SM120 should not require artifactory"),
+            ),
+        ):
+            assert flashinfer_utils.supports_trtllm_attention()
+    finally:
+        flashinfer_utils.supports_trtllm_attention.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -427,3 +458,79 @@ def test_per_head_quant_scales_backend_selection(
                     use_per_head_quant_scales=True,
                 )
             assert backend_name in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype,device_capability,expected_reason",
+    [
+        ("nvfp4", DeviceCapability(12, 0), None),
+        ("fp8_e4m3", DeviceCapability(12, 0), "head_size=512 requires nvfp4"),
+        (
+            "nvfp4",
+            DeviceCapability(9, 0),
+            "head_size=512 with nvfp4 KV cache requires SM120/SM121",
+        ),
+    ],
+)
+def test_flashinfer_512_head_support_requires_nvfp4_sm120(
+    kv_cache_dtype,
+    device_capability,
+    expected_reason,
+):
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+    reasons = FlashInferBackend.validate_configuration(
+        head_size=512,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=device_capability,
+        attn_type=AttentionType.DECODER,
+    )
+
+    if expected_reason is None:
+        assert reasons == []
+    else:
+        assert any(expected_reason in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "cache_dtype,kv_quant_mode,spec_dtype,expected_dtype",
+    [
+        ("auto", KVQuantMode.NONE, torch.bfloat16, torch.bfloat16),
+        (
+            "fp8_e4m3",
+            KVQuantMode.FP8_PER_TENSOR,
+            torch.uint8,
+            torch.float8_e4m3fn,
+        ),
+        ("nvfp4", KVQuantMode.NVFP4, torch.uint8, torch.uint8),
+    ],
+)
+def test_flashinfer_kv_data_type_matches_plan_api(
+    cache_dtype,
+    kv_quant_mode,
+    spec_dtype,
+    expected_dtype,
+):
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=spec_dtype,
+        kv_quant_mode=kv_quant_mode,
+    )
+
+    assert (
+        FlashInferBackend.get_kv_data_type_for_flashinfer(kv_cache_spec, cache_dtype)
+        == expected_dtype
+    )

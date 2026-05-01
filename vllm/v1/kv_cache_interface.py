@@ -76,6 +76,15 @@ def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
 
 
+def _kv_cache_head_size_bytes(
+    head_size: int, dtype: torch.dtype, kv_quant_mode: KVQuantMode
+) -> int:
+    if kv_quant_mode.is_nvfp4:
+        # Packed layout per head: fp4 data + fp8 block scales.
+        return nvfp4_kv_cache_full_dim(head_size) * get_dtype_size(dtype)
+    return head_size * get_dtype_size(dtype)
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
@@ -146,22 +155,11 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4:
-            # Packed layout: fp4 data + fp8 block scales per head.
-            full_dim = nvfp4_kv_cache_full_dim(self.head_size)
-            return (
-                2
-                * self.block_size
-                * self.num_kv_heads
-                * full_dim
-                * get_dtype_size(self.dtype)
-            )
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
-            * get_dtype_size(self.dtype)
+            * _kv_cache_head_size_bytes(self.head_size, self.dtype, self.kv_quant_mode)
         )
 
 
@@ -258,24 +256,17 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4:
-            # Packed layout per head: fp4 data + fp8 block scales.
-            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
-            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
-            last_dim = nvfp4_kv_cache_full_dim(
-                self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-            return (
-                self.block_size
-                * self.num_kv_heads
-                * last_dim
-                * get_dtype_size(self.dtype)
-            )
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
+            * (
+                _kv_cache_head_size_bytes(
+                    self.head_size, self.dtype, self.kv_quant_mode
+                )
+                + _kv_cache_head_size_bytes(
+                    self.head_size_v, self.dtype, self.kv_quant_mode
+                )
+            )
         )
 
 
@@ -377,8 +368,14 @@ class SlidingWindowSpec(AttentionSpec):
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
+            * (
+                _kv_cache_head_size_bytes(
+                    self.head_size, self.dtype, self.kv_quant_mode
+                )
+                + _kv_cache_head_size_bytes(
+                    self.head_size_v, self.dtype, self.kv_quant_mode
+                )
+            )
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:

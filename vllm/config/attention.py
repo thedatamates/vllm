@@ -48,6 +48,12 @@ class AttentionConfig:
     disable_flashinfer_q_quantization: bool = False
     """If set, when using fp8 kv, do not quantize Q to fp8."""
 
+    use_flashinfer_sm120_nvfp4_prefill: bool = False
+    """If set, use FlashInfer's SM120/SM121 NVFP4 paged prefill sub-backend
+    for eligible BF16-Q/NVFP4-KV attention calls. This is intentionally
+    manual because the kernel has a narrower support surface than generic
+    FlashInfer prefill."""
+
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 

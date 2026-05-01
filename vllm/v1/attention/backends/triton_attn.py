@@ -18,7 +18,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    nvfp4_kv_cache_full_dim,
+    nvfp4_kv_cache_split_views,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -278,6 +282,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "int8_per_token_head",
         "fp8_per_token_head",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -314,6 +319,19 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str == "nvfp4":
+            if head_size % 64 != 0:
+                raise ValueError(
+                    "NVFP4 KV cache with Triton attention requires head_size "
+                    "to be divisible by 64."
+                )
+            return (
+                num_blocks,
+                2,
+                block_size,
+                num_kv_heads,
+                nvfp4_kv_cache_full_dim(head_size),
+            )
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
             # the per-head scale fits inline.  The backend extracts
@@ -563,8 +581,17 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if self._kv_quant_mode.is_nvfp4:
+            (key_cache, value_cache), (k_scale_cache, v_scale_cache) = (
+                nvfp4_kv_cache_split_views(kv_cache)
+            )
+            assert layer._q_scale_float == 1.0, (
+                "A non 1.0 q_scale is not currently supported."
+            )
+            k_descale = layer._k_scale
+            v_descale = layer._v_scale
         # Per-token-head quantized KV cache: use separate scale caches.
-        if self._is_per_token_head_quant:
+        elif self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
             if key_cache.dtype == torch.uint8:
@@ -715,6 +742,18 @@ class TritonAttentionImpl(AttentionImpl):
                 self._k_scale_cache,
                 self._v_scale_cache,
                 slot_mapping,
+            )
+            return
+        if self._kv_quant_mode.is_nvfp4:
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key,
+                value,
+                kv_cache[:, 0],
+                kv_cache[:, 1],
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
             )
             return
         # For decoder and cross-attention, use KV cache as before.

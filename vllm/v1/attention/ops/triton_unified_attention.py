@@ -34,6 +34,147 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def _fp4_e2m1_to_float32(nibble):
+    abs_val = nibble & 0x7
+    out = tl.where(
+        abs_val == 0,
+        0.0,
+        tl.where(
+            abs_val == 1,
+            0.5,
+            tl.where(
+                abs_val == 2,
+                1.0,
+                tl.where(
+                    abs_val == 3,
+                    1.5,
+                    tl.where(
+                        abs_val == 4,
+                        2.0,
+                        tl.where(abs_val == 5, 3.0, tl.where(abs_val == 6, 4.0, 6.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return tl.where((nibble & 0x8) != 0, -out, out)
+
+
+@triton.jit
+def _unpack_nvfp4_byte(packed, dim_offset):
+    packed_i32 = packed.to(tl.int32)
+    low = packed_i32 & 0x0F
+    high = (packed_i32 >> 4) & 0x0F
+    nibble = tl.where((dim_offset & 1) == 0, low, high)
+    return _fp4_e2m1_to_float32(nibble)
+
+
+@triton.jit
+def _load_nvfp4_k_tile(
+    key_data_ptr,
+    k_scale_cache_ptr,
+    tensor_scale,
+    physical_block_idx,
+    seq_offset,
+    kv_head_idx,
+    offs_d,
+    dim_mask,
+    tile_mask,
+    stride_k_cache_0: tl.int64,
+    stride_k_cache_1: tl.int64,
+    stride_k_cache_2: tl.int64,
+    stride_k_cache_3: tl.constexpr,
+    stride_ks_blk,
+    stride_ks_slot,
+    stride_ks_head,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+):
+    byte_offset = (
+        physical_block_idx[None, :] * stride_k_cache_0
+        + kv_head_idx * stride_k_cache_2
+        + (offs_d[:, None] // 2) * stride_k_cache_3
+        + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+    )
+    packed = tl.load(
+        key_data_ptr + byte_offset,
+        mask=dim_mask[:, None] & tile_mask[None, :],
+        other=0,
+    )
+    fp4_val = _unpack_nvfp4_byte(packed, offs_d[:, None])
+
+    scale_idx = offs_d // 16
+    scale_offset = (
+        physical_block_idx[None, :] * stride_ks_blk
+        + (seq_offset % BLOCK_SIZE)[None, :] * stride_ks_slot
+        + kv_head_idx * stride_ks_head
+        + scale_idx[:, None]
+    )
+    block_scale = tl.load(
+        k_scale_cache_ptr + scale_offset,
+        mask=dim_mask[:, None] & tile_mask[None, :],
+        other=1.0,
+    ).to(tl.float32)
+    return fp4_val * block_scale * tl.load(tensor_scale)
+
+
+@triton.jit
+def _load_nvfp4_v_tile(
+    value_data_ptr,
+    v_scale_cache_ptr,
+    tensor_scale,
+    physical_block_idx,
+    seq_offset,
+    kv_head_idx,
+    offs_d,
+    dim_mask,
+    tile_mask,
+    stride_v_cache_0: tl.int64,
+    stride_v_cache_1: tl.int64,
+    stride_v_cache_2: tl.int64,
+    stride_v_cache_3: tl.constexpr,
+    stride_vs_blk,
+    stride_vs_slot,
+    stride_vs_head,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+):
+    byte_offset = (
+        physical_block_idx[:, None] * stride_v_cache_0
+        + kv_head_idx * stride_v_cache_2
+        + (offs_d[None, :] // 2) * stride_v_cache_3
+        + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+    )
+    packed = tl.load(
+        value_data_ptr + byte_offset,
+        mask=tile_mask[:, None] & dim_mask[None, :],
+        other=0,
+    )
+    fp4_val = _unpack_nvfp4_byte(packed, offs_d[None, :])
+
+    scale_dim: tl.constexpr = HEAD_SIZE // 16
+    scale_group: tl.constexpr = scale_dim // 4
+    scale_idx = offs_d // 16
+    token_in_block = seq_offset % BLOCK_SIZE
+    swizzled_t = (token_in_block[:, None] // 4) * 4 + (
+        scale_idx[None, :] // scale_group
+    )
+    swizzled_s = (scale_idx[None, :] % scale_group) * 4 + (token_in_block[:, None] % 4)
+    scale_offset = (
+        physical_block_idx[:, None] * stride_vs_blk
+        + swizzled_t * stride_vs_slot
+        + kv_head_idx * stride_vs_head
+        + swizzled_s
+    )
+    block_scale = tl.load(
+        v_scale_cache_ptr + scale_offset,
+        mask=tile_mask[:, None] & dim_mask[None, :],
+        other=1.0,
+    ).to(tl.float32)
+    return fp4_val * block_scale * tl.load(tensor_scale)
+
+
+@triton.jit
 def _prepare_kv_tile(
     data,
     Q,
@@ -57,16 +198,17 @@ def _prepare_kv_tile(
     - ``KV_QUANT_MODE == 0``: cast only (no-op for bf16/fp16).
     - ``KV_QUANT_MODE == 1`` (FP8 per-tensor): dequantize inline
       using the tensor-wide scale.
-    - ``KV_QUANT_MODE >= 2`` (per-token-head int8/fp8): cast to Q's
+    - ``KV_QUANT_MODE == 2 or 3`` (per-token-head int8/fp8): cast to Q's
       dtype and return per-head scales separately — the caller applies
       them after the dot product for better numerical efficiency.
 
     Returns ``(data, token_head_scales)``.  *token_head_scales* is only
-    meaningful when ``KV_QUANT_MODE >= 2``; callers gate its use on
+    meaningful for per-token-head modes; callers gate its use on
     the same constexpr so the compiler eliminates dead code.
     """
     # KV_QUANT_MODE values: 0=none, 1=fp8 per-tensor,
-    #                       2=int8 per-token-head, 3=fp8 per-token-head
+    #                       2=int8 per-token-head, 3=fp8 per-token-head,
+    #                       4=nvfp4 packed data + fp8 block scales
 
     # Placeholder scales (float32) — never read when KV_QUANT_MODE < 2.
     unused_scales = tile_mask.to(tl.float32)
@@ -75,7 +217,7 @@ def _prepare_kv_tile(
         if Q.dtype.is_fp8():
             return data.to(Q.dtype), unused_scales
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype), unused_scales
-    if KV_QUANT_MODE >= 2:  # per-token-head (int8 or fp8)
+    if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
         scale_idx = (
             physical_block_idx * stride_s_blk
             + (seq_offset % BLOCK_SIZE) * stride_s_slot
@@ -328,49 +470,95 @@ def kernel_unified_attention_2d(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K, k_token_head_scales = _prepare_kv_tile(
-            K_load,
-            Q,
-            k_scale,
-            k_scale_cache_ptr,
-            physical_block_idx,
-            seq_offset,
-            kv_head_idx,
-            stride_ks_blk,
-            stride_ks_slot,
-            stride_ks_head,
-            tile_mask,
-            BLOCK_SIZE,
-            KV_QUANT_MODE,
-        )
+        if KV_QUANT_MODE == 4:
+            K = _load_nvfp4_k_tile(
+                key_cache_ptr,
+                k_scale_cache_ptr,
+                k_scale,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                BLOCK_SIZE,
+                HEAD_SIZE,
+            ).to(Q.dtype)
+            k_token_head_scales = tile_mask.to(tl.float32)
+        else:
+            # K : (HEAD_SIZE, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K, k_token_head_scales = _prepare_kv_tile(
+                K_load,
+                Q,
+                k_scale,
+                k_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V, v_token_head_scales = _prepare_kv_tile(
-            V_load,
-            Q,
-            v_scale,
-            v_scale_cache_ptr,
-            physical_block_idx,
-            seq_offset,
-            kv_head_idx,
-            stride_vs_blk,
-            stride_vs_slot,
-            stride_vs_head,
-            tile_mask,
-            BLOCK_SIZE,
-            KV_QUANT_MODE,
-        )
+        if KV_QUANT_MODE == 4:
+            V = _load_nvfp4_v_tile(
+                value_cache_ptr,
+                v_scale_cache_ptr,
+                v_scale,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                BLOCK_SIZE,
+                HEAD_SIZE,
+            ).to(Q.dtype)
+            v_token_head_scales = tile_mask.to(tl.float32)
+        else:
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V, v_token_head_scales = _prepare_kv_tile(
+                V_load,
+                Q,
+                v_scale,
+                v_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -420,7 +608,7 @@ def kernel_unified_attention_2d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
             S += scale * tl.dot(Q, K)
@@ -488,7 +676,7 @@ def kernel_unified_attention_2d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # Per-token-head quant: apply v_scale to P instead of V.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:
@@ -735,49 +923,95 @@ def kernel_unified_attention_3d(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K, k_token_head_scales = _prepare_kv_tile(
-            K_load,
-            Q,
-            k_scale,
-            k_scale_cache_ptr,
-            physical_block_idx,
-            seq_offset,
-            kv_head_idx,
-            stride_ks_blk,
-            stride_ks_slot,
-            stride_ks_head,
-            tile_mask,
-            BLOCK_SIZE,
-            KV_QUANT_MODE,
-        )
+        if KV_QUANT_MODE == 4:
+            K = _load_nvfp4_k_tile(
+                key_cache_ptr,
+                k_scale_cache_ptr,
+                k_scale,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                BLOCK_SIZE,
+                HEAD_SIZE,
+            ).to(Q.dtype)
+            k_token_head_scales = tile_mask.to(tl.float32)
+        else:
+            # K : (HEAD_SIZE, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K, k_token_head_scales = _prepare_kv_tile(
+                K_load,
+                Q,
+                k_scale,
+                k_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_ks_blk,
+                stride_ks_slot,
+                stride_ks_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V, v_token_head_scales = _prepare_kv_tile(
-            V_load,
-            Q,
-            v_scale,
-            v_scale_cache_ptr,
-            physical_block_idx,
-            seq_offset,
-            kv_head_idx,
-            stride_vs_blk,
-            stride_vs_slot,
-            stride_vs_head,
-            tile_mask,
-            BLOCK_SIZE,
-            KV_QUANT_MODE,
-        )
+        if KV_QUANT_MODE == 4:
+            V = _load_nvfp4_v_tile(
+                value_cache_ptr,
+                v_scale_cache_ptr,
+                v_scale,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                BLOCK_SIZE,
+                HEAD_SIZE,
+            ).to(Q.dtype)
+            v_token_head_scales = tile_mask.to(tl.float32)
+        else:
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V, v_token_head_scales = _prepare_kv_tile(
+                V_load,
+                Q,
+                v_scale,
+                v_scale_cache_ptr,
+                physical_block_idx,
+                seq_offset,
+                kv_head_idx,
+                stride_vs_blk,
+                stride_vs_slot,
+                stride_vs_head,
+                tile_mask,
+                BLOCK_SIZE,
+                KV_QUANT_MODE,
+            )
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -827,7 +1061,7 @@ def kernel_unified_attention_3d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
             S += scale * tl.dot(Q, K)
@@ -895,7 +1129,7 @@ def kernel_unified_attention_3d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # Per-token-head quant: apply v_scale to P instead of V.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:

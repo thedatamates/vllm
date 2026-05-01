@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -56,6 +57,33 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
 
 
 class Gemma4Config(VerifyAndUpdateConfig):
+    _FLASHINFER_NVFP4_HEAD_DIMS = frozenset({64, 128, 256, 512})
+
+    @staticmethod
+    def _flashinfer_supports_heterogeneous_nvfp4_heads(
+        vllm_config: "VllmConfig",
+    ) -> bool:
+        hf_text_config = vllm_config.model_config.hf_text_config
+        head_dim = getattr(hf_text_config, "head_dim", None)
+        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+
+        if head_dim is None or global_head_dim is None:
+            return False
+        if (
+            head_dim not in Gemma4Config._FLASHINFER_NVFP4_HEAD_DIMS
+            or global_head_dim not in Gemma4Config._FLASHINFER_NVFP4_HEAD_DIMS
+        ):
+            return False
+        if max(head_dim, global_head_dim) != 512:
+            return False
+        if vllm_config.cache_config.cache_dtype != "nvfp4":
+            return False
+
+        from vllm.platforms import current_platform
+
+        capability = current_platform.get_device_capability()
+        return capability in (DeviceCapability(12, 0), DeviceCapability(12, 1))
+
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Force unified attention backend for models with heterogeneous
@@ -69,8 +97,11 @@ class Gemma4Config(VerifyAndUpdateConfig):
         numerical divergence and output corruption.
 
         The fix detects heterogeneous head dimensions from the model config
-        and forces TRITON_ATTN (which has no head_size ceiling) for all
-        layers when the user hasn't explicitly chosen a backend.
+        and forces a single backend for all layers when the user hasn't
+        explicitly chosen one. Most configurations use TRITON_ATTN because it
+        has no head_size ceiling. Gemma4 with NVFP4 KV cache on SM120/SM121
+        uses FLASHINFER because its NVFP4 prefill/decode paths support both
+        256-wide sliding-window layers and 512-wide full-attention layers there.
 
         TODO: Heterogeneous head_sizes (head_dim != global_head_dim)
         require NixlConnector changes to support per-layer KV transfer
@@ -80,7 +111,7 @@ class Gemma4Config(VerifyAndUpdateConfig):
         head_dim = getattr(hf_text_config, "head_dim", None)
         global_head_dim = getattr(hf_text_config, "global_head_dim", None)
 
-        # Only force Triton when head dimensions actually differ AND the
+        # Only force a backend when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).
         # This avoids unnecessary backend forcing on smaller models where
         # the config carries global_head_dim but all layers can still use
@@ -97,13 +128,21 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 AttentionBackendEnum,
             )
 
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            if Gemma4Config._flashinfer_supports_heterogeneous_nvfp4_heads(
+                vllm_config
+            ):
+                backend = AttentionBackendEnum.FLASHINFER
+            else:
+                backend = AttentionBackendEnum.TRITON_ATTN
+
+            vllm_config.attention_config.backend = backend
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
-                "(head_dim=%d, global_head_dim=%d). Forcing TRITON_ATTN "
-                "backend to prevent mixed-backend numerical divergence.",
+                "(head_dim=%d, global_head_dim=%d). Forcing %s backend to "
+                "prevent mixed-backend numerical divergence.",
                 head_dim,
                 global_head_dim,
+                backend.name,
             )
 
 

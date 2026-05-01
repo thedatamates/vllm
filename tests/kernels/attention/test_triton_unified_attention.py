@@ -5,10 +5,16 @@
 import pytest
 import torch
 
+from tests.kernels.quantization.nvfp4_utils import break_fp4_bytes
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import (
+    nvfp4_kv_cache_full_dim,
+    nvfp4_kv_cache_split_views,
+    set_random_seed,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.kv_cache_interface import KVQuantMode
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -89,6 +95,45 @@ def ref_paged_attn(
         start_idx += query_len
 
     return torch.cat(outputs, dim=0)
+
+
+def _unswizzle_nvfp4_value_scales_nhd(
+    scale_cache: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Convert the CUDA NVFP4 V-scale swizzle back to linear NHD layout."""
+    _, _, _, scale_dim = scale_cache.shape
+    scale_group = scale_dim // 4
+    linear = torch.empty_like(scale_cache)
+    for t in range(block_size):
+        for s in range(scale_dim):
+            swizzled_t = (t // 4) * 4 + (s // scale_group)
+            swizzled_s = (s % scale_group) * 4 + (t % 4)
+            linear[:, t, :, s] = scale_cache[:, swizzled_t, :, swizzled_s]
+    return linear
+
+
+def _dequant_nvfp4_cache_nhd(
+    data_cache: torch.Tensor,
+    scale_cache: torch.Tensor,
+    global_scale: torch.Tensor,
+    head_size: int,
+    value_scale_swizzled: bool,
+) -> torch.Tensor:
+    """Dequantize an NHD NVFP4 cache side written by reshape_and_cache_flash."""
+    num_blocks, block_size, num_heads, data_dim = data_cache.shape
+    scale_dim = head_size // 16
+    assert data_dim == head_size // 2
+    if value_scale_swizzled:
+        scale_cache = _unswizzle_nvfp4_value_scales_nhd(scale_cache, block_size)
+
+    fp4_vals = break_fp4_bytes(data_cache.reshape(-1, data_dim), torch.float32)
+    fp4_vals = fp4_vals.reshape(num_blocks, block_size, num_heads, head_size)
+    scale_f32 = scale_cache.to(torch.float32) * global_scale
+    return (
+        fp4_vals.reshape(num_blocks, block_size, num_heads, scale_dim, 16)
+        * scale_f32.unsqueeze(-1)
+    ).reshape(num_blocks, block_size, num_heads, head_size)
 
 
 @pytest.mark.parametrize(
@@ -221,6 +266,148 @@ def test_triton_unified_attn(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "seq_threshold_3D"),
+    [
+        ([(3, 41), (5, 18), (7, 73)], 0),
+        ([(1, 41), (1, 18), (1, 73)], 0),
+        ([(1, 41), (1, 18), (1, 73)], 8),
+    ],
+)
+@pytest.mark.parametrize("head_size", [128, 256, 512])
+@torch.inference_mode()
+def test_triton_unified_attn_nvfp4(
+    seq_lens: list[tuple[int, int]],
+    seq_threshold_3D: int,
+    head_size: int,
+) -> None:
+    if not current_platform.has_device_capability(100):
+        pytest.skip("NVFP4 requires compute capability >= 10.0 (Blackwell).")
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    dtype = torch.bfloat16
+    block_size = 16
+    num_blocks = 64
+    num_query_heads = 4
+    num_kv_heads = 2
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens_list)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache_ref = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache_ref = torch.randn_like(key_cache_ref)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(seq_lens), max_num_blocks_per_seq), dtype=torch.int32
+    )
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+
+    full_dim = nvfp4_kv_cache_full_dim(head_size)
+    kv_cache = torch.empty(
+        num_blocks,
+        2,
+        block_size,
+        num_kv_heads,
+        full_dim,
+        dtype=torch.uint8,
+    )
+    k_scale = (key_cache_ref.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+    v_scale = (value_cache_ref.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+
+    num_slots = num_blocks * block_size
+    slot_mapping = torch.arange(num_slots, dtype=torch.long)
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+        key_cache_ref.reshape(num_slots, num_kv_heads, head_size),
+        value_cache_ref.reshape(num_slots, num_kv_heads, head_size),
+        kv_cache[:, 0],
+        kv_cache[:, 1],
+        slot_mapping,
+        "nvfp4",
+        k_scale,
+        v_scale,
+    )
+    (key_data, value_data), (key_scales, value_scales) = nvfp4_kv_cache_split_views(
+        kv_cache
+    )
+
+    dequant_key_cache = _dequant_nvfp4_cache_nhd(
+        key_data, key_scales, k_scale, head_size, value_scale_swizzled=False
+    ).to(dtype)
+    dequant_value_cache = _dequant_nvfp4_cache_nhd(
+        value_data, value_scales, v_scale, head_size, value_scale_swizzled=True
+    ).to(dtype)
+
+    output = torch.empty_like(query)
+    num_par_softmax_segments = 16
+    head_size_padded = next_power_of_2(head_size)
+    softmax_segm_output = torch.empty(
+        (
+            seq_threshold_3D,
+            num_query_heads,
+            num_par_softmax_segments,
+            head_size_padded,
+        ),
+        dtype=torch.float32,
+    )
+    softmax_segm_max = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+    softmax_segm_expsum = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_data,
+        v=value_data,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+        kv_quant_mode=KVQuantMode.NVFP4,
+        k_scale_cache=key_scales,
+        v_scale_cache=value_scales,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=dequant_key_cache,
+        value_cache=dequant_value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=2e-1, rtol=2e-1)
 
 
 @pytest.mark.parametrize(
